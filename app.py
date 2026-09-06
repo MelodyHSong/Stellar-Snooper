@@ -19,6 +19,18 @@ from collections import defaultdict
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+from file_searcher import (
+    search_files_engine,
+    save_results_to_file as save_search_results,
+    calculate_relevance,
+    search_files as cli_search_files
+)
+from directory_mapper import (
+    generate_directory_tree,
+    save_tree_to_file as save_map_tree,
+    map_directory as cli_map_directory
+)
+
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
     try:
@@ -136,6 +148,20 @@ class DriveAnalyzerApp:
         self.stop_requested = False
         self.scan_thread = None
 
+        # File Searcher State
+        self.is_searching = False
+        self.stop_search_requested = False
+        self.search_thread = None
+        self.search_results = []
+        self.search_summary = {}
+
+        # Directory Mapper State
+        self.is_mapping = False
+        self.stop_map_requested = False
+        self.map_thread = None
+        self.map_result_text = ""
+        self.map_stats = {}
+
         # Scan Results Cache
         self.current_target = None
         self.scanned_files = []
@@ -187,11 +213,15 @@ class DriveAnalyzerApp:
     def load_config(self):
         default_config = {
             "app_name": "Stellar Snooper",
-            "version": "1.0.0",
+            "version": "1.1.0",
             "preferences": {
                 "default_drive": "C:",
                 "top_files_limit": 20,
                 "top_folders_limit": 10,
+                "search_limit": 50,
+                "search_default_extension": "ANY",
+                "mapper_max_depth": 3,
+                "mapper_ignore_hidden": True,
                 "export_format": "json",
                 "confirm_exit_on_scan": True
             }
@@ -548,7 +578,17 @@ class DriveAnalyzerApp:
         self.notebook.add(tab_analytics, text="  📊 Storage Analytics  ")
         self.build_analytics_tab(tab_analytics)
 
-        # Tab 4: Activity Log & Terminal Console
+        # Tab 4: File Searcher
+        tab_search = tk.Frame(self.notebook, bg=BG_PANEL)
+        self.notebook.add(tab_search, text="  🔍 File Searcher  ")
+        self.build_search_tab(tab_search)
+
+        # Tab 5: Directory Mapper
+        tab_mapper = tk.Frame(self.notebook, bg=BG_PANEL)
+        self.notebook.add(tab_mapper, text="  🗺️ Directory Mapper  ")
+        self.build_mapper_tab(tab_mapper)
+
+        # Tab 6: Activity Log & Terminal Console
         tab_log = tk.Frame(self.notebook, bg=BG_PANEL)
         self.notebook.add(tab_log, text="  📜 Activity Log  ")
         self.build_log_tab(tab_log)
@@ -660,6 +700,512 @@ class DriveAnalyzerApp:
         scroll_ext.pack(side="right", fill="y")
         self.tree_ext.pack(fill="both", expand=True)
 
+    def build_search_tab(self, parent):
+        box = tk.Frame(parent, bg=BG_MAIN)
+        box.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # 1. Search Control Card (Top Bar)
+        ctrl_card = tk.Frame(box, bg=BG_PANEL, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        ctrl_card.pack(fill="x", pady=(0, 6), padx=2)
+
+        # Row 0: Target Location
+        row0 = tk.Frame(ctrl_card, bg=BG_PANEL)
+        row0.pack(fill="x", padx=10, pady=(8, 4))
+
+        lbl_loc = tk.Label(row0, text="Search Path:", font=FONT_UI_BOLD, fg=ACCENT_GOLD, bg=BG_PANEL, width=12, anchor="w")
+        lbl_loc.pack(side="left")
+
+        self.search_path_var = tk.StringVar(value=self.current_target or "C:\\")
+        entry_search_path = tk.Entry(
+            row0,
+            textvariable=self.search_path_var,
+            font=FONT_CODE,
+            bg=BG_SURFACE,
+            fg=TEXT_PRIMARY,
+            insertbackground=ACCENT_CYAN,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR
+        )
+        entry_search_path.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        btn_browse_search = tk.Button(
+            row0,
+            text="📁 Browse...",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=2,
+            cursor="hand2",
+            command=self.on_browse_search_path
+        )
+        btn_browse_search.pack(side="left", padx=2)
+
+        btn_sync_search = tk.Button(
+            row0,
+            text="🔄 Active Target",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=8,
+            pady=2,
+            cursor="hand2",
+            command=self.sync_search_with_active_target
+        )
+        btn_sync_search.pack(side="left", padx=2)
+
+        # Row 1: Query, Extension, Limit, Search Button
+        row1 = tk.Frame(ctrl_card, bg=BG_PANEL)
+        row1.pack(fill="x", padx=10, pady=(4, 10))
+
+        lbl_query = tk.Label(row1, text="Query / Name:", font=FONT_UI_BOLD, fg=TEXT_PRIMARY, bg=BG_PANEL, width=12, anchor="w")
+        lbl_query.pack(side="left")
+
+        self.search_query_var = tk.StringVar()
+        entry_query = tk.Entry(
+            row1,
+            textvariable=self.search_query_var,
+            font=FONT_UI,
+            bg=BG_SURFACE,
+            fg=TEXT_PRIMARY,
+            insertbackground=ACCENT_CYAN,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR
+        )
+        entry_query.pack(side="left", fill="x", expand=True, padx=(0, 4))
+        entry_query.bind("<Return>", lambda e: self.toggle_search())
+
+        btn_clear_query = tk.Button(
+            row1,
+            text="✕",
+            font=FONT_UI_BOLD,
+            fg=TEXT_MUTED,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=6,
+            pady=2,
+            cursor="hand2",
+            command=lambda: self.search_query_var.set("")
+        )
+        btn_clear_query.pack(side="left", padx=(0, 10))
+
+        lbl_ext = tk.Label(row1, text="Ext:", font=FONT_UI_BOLD, fg=TEXT_PRIMARY, bg=BG_PANEL)
+        lbl_ext.pack(side="left", padx=(4, 4))
+
+        self.search_ext_var = tk.StringVar(value=self.config.get("preferences", {}).get("search_default_extension", "ANY"))
+        combo_ext = ttk.Combobox(
+            row1,
+            textvariable=self.search_ext_var,
+            values=["ANY", "txt", "pdf", "docx", "py", "exe", "zip", "png", "jpg", "mp4", "iso"],
+            width=7,
+            font=FONT_UI
+        )
+        combo_ext.pack(side="left", padx=(0, 10))
+
+        lbl_limit = tk.Label(row1, text="Limit:", font=FONT_UI_BOLD, fg=TEXT_PRIMARY, bg=BG_PANEL)
+        lbl_limit.pack(side="left", padx=(4, 4))
+
+        self.search_limit_var = tk.StringVar(value=str(self.config.get("preferences", {}).get("search_limit", 50)))
+        combo_limit = ttk.Combobox(
+            row1,
+            textvariable=self.search_limit_var,
+            values=["25", "50", "100", "250", "500", "ALL"],
+            width=6,
+            state="readonly",
+            font=FONT_UI
+        )
+        combo_limit.pack(side="left", padx=(0, 12))
+
+        self.btn_search = tk.Button(
+            row1,
+            text="🔍 Search Files",
+            font=FONT_UI_BOLD,
+            fg=BG_MAIN,
+            bg=ACCENT_CYAN,
+            activebackground="#79c0ff",
+            activeforeground=BG_MAIN,
+            relief="flat",
+            padx=14,
+            pady=3,
+            cursor="hand2",
+            command=self.toggle_search
+        )
+        self.btn_search.pack(side="left")
+
+        # 2. Live Telemetry Strip
+        telemetry_frame = tk.Frame(box, bg=BG_SURFACE, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        telemetry_frame.pack(fill="x", pady=(0, 6), padx=2)
+
+        self.lbl_search_status = tk.Label(
+            telemetry_frame,
+            text="Ready to search • Enter a search query or filter by file extension.",
+            font=FONT_UI,
+            fg=ACCENT_CYAN,
+            bg=BG_SURFACE,
+            padx=10,
+            pady=4
+        )
+        self.lbl_search_status.pack(side="left")
+
+        self.lbl_search_metrics = tk.Label(
+            telemetry_frame,
+            text="Folders: 0 | Matches: 0 | Time: 00:00.0",
+            font=FONT_STATS,
+            fg=TEXT_MUTED,
+            bg=BG_SURFACE,
+            padx=10,
+            pady=4
+        )
+        self.lbl_search_metrics.pack(side="right")
+
+        # 3. Search Results Table
+        table_box = tk.Frame(box, bg=BG_MAIN, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        table_box.pack(fill="both", expand=True, padx=2, pady=(0, 6))
+
+        cols = ("rank", "relevance", "name", "ext", "size", "dir")
+        self.tree_search = ttk.Treeview(table_box, columns=cols, show="headings", selectmode="browse")
+        self.tree_search.heading("rank", text="#", anchor="center", command=lambda: self.sort_tree(self.tree_search, "rank", False, is_num=True))
+        self.tree_search.heading("relevance", text="Relevance", anchor="center", command=lambda: self.sort_tree(self.tree_search, "relevance", True, is_pct=True))
+        self.tree_search.heading("name", text="File Name", anchor="w", command=lambda: self.sort_tree(self.tree_search, "name", False))
+        self.tree_search.heading("ext", text="Type", anchor="center", command=lambda: self.sort_tree(self.tree_search, "ext", False))
+        self.tree_search.heading("size", text="Size", anchor="e", command=lambda: self.sort_tree(self.tree_search, "size", True, is_size=True))
+        self.tree_search.heading("dir", text="Directory Path", anchor="w", command=lambda: self.sort_tree(self.tree_search, "dir", False))
+
+        self.tree_search.column("rank", width=42, stretch=False, anchor="center")
+        self.tree_search.column("relevance", width=85, stretch=False, anchor="center")
+        self.tree_search.column("name", width=230, anchor="w")
+        self.tree_search.column("ext", width=70, stretch=False, anchor="center")
+        self.tree_search.column("size", width=110, stretch=False, anchor="e")
+        self.tree_search.column("dir", width=420, anchor="w")
+
+        scroll_y = ttk.Scrollbar(table_box, orient="vertical", command=self.tree_search.yview)
+        scroll_x = ttk.Scrollbar(table_box, orient="horizontal", command=self.tree_search.xview)
+        self.tree_search.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        scroll_y.pack(side="right", fill="y")
+        scroll_x.pack(side="bottom", fill="x")
+        self.tree_search.pack(fill="both", expand=True)
+
+        # Double click & Context Menu
+        self.tree_search.bind("<Double-1>", self.on_search_file_double_click)
+        self.menu_search = tk.Menu(self.root, tearoff=0, bg=BG_SURFACE, fg=TEXT_PRIMARY, activebackground=BG_ACTIVE)
+        self.menu_search.add_command(label="Open in Windows Explorer", command=self.reveal_selected_search_file)
+        self.menu_search.add_command(label="Open File", command=self.open_selected_search_file)
+        self.menu_search.add_command(label="Copy Full Path", command=self.copy_selected_search_file_path)
+        self.menu_search.add_command(label="Copy Directory Path", command=self.copy_selected_search_dir_path)
+        self.tree_search.bind("<Button-3>", self.show_search_context_menu)
+
+        # 4. Bottom Action Bar
+        action_bar = tk.Frame(box, bg=BG_MAIN)
+        action_bar.pack(fill="x", padx=2, pady=2)
+
+        btn_export = tk.Button(
+            action_bar,
+            text="💾  Export Search Results...",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.on_export_search_results
+        )
+        btn_export.pack(side="left", padx=(0, 6))
+
+        btn_copy = tk.Button(
+            action_bar,
+            text="📋  Copy Path",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.copy_selected_search_file_path
+        )
+        btn_copy.pack(side="left", padx=2)
+
+        btn_clear = tk.Button(
+            action_bar,
+            text="🧹  Clear Search",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.clear_search_results
+        )
+        btn_clear.pack(side="left", padx=2)
+
+        self.lbl_search_summary_count = tk.Label(
+            action_bar,
+            text="0 matches listed",
+            font=FONT_STATS,
+            fg=TEXT_MUTED,
+            bg=BG_MAIN
+        )
+        self.lbl_search_summary_count.pack(side="right", padx=6)
+
+    def build_mapper_tab(self, parent):
+        box = tk.Frame(parent, bg=BG_MAIN)
+        box.pack(fill="both", expand=True, padx=8, pady=8)
+
+        # 1. Controls Top Bar
+        ctrl_card = tk.Frame(box, bg=BG_PANEL, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        ctrl_card.pack(fill="x", pady=(0, 6), padx=2)
+
+        # Row 0: Target Path
+        row0 = tk.Frame(ctrl_card, bg=BG_PANEL)
+        row0.pack(fill="x", padx=10, pady=(8, 4))
+
+        lbl_loc = tk.Label(row0, text="Map Target:", font=FONT_UI_BOLD, fg=ACCENT_GOLD, bg=BG_PANEL, width=12, anchor="w")
+        lbl_loc.pack(side="left")
+
+        self.mapper_path_var = tk.StringVar(value=self.current_target or "C:\\")
+        entry_map_path = tk.Entry(
+            row0,
+            textvariable=self.mapper_path_var,
+            font=FONT_CODE,
+            bg=BG_SURFACE,
+            fg=TEXT_PRIMARY,
+            insertbackground=ACCENT_CYAN,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=BORDER_COLOR
+        )
+        entry_map_path.pack(side="left", fill="x", expand=True, padx=(0, 8))
+
+        btn_browse_map = tk.Button(
+            row0,
+            text="📁 Browse...",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=2,
+            cursor="hand2",
+            command=self.on_browse_mapper_path
+        )
+        btn_browse_map.pack(side="left", padx=2)
+
+        btn_sync_map = tk.Button(
+            row0,
+            text="🔄 Active Target",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=8,
+            pady=2,
+            cursor="hand2",
+            command=self.sync_mapper_with_active_target
+        )
+        btn_sync_map.pack(side="left", padx=2)
+
+        # Row 1: Options & Generate Button
+        row1 = tk.Frame(ctrl_card, bg=BG_PANEL)
+        row1.pack(fill="x", padx=10, pady=(4, 10))
+
+        lbl_depth = tk.Label(row1, text="Max Depth:", font=FONT_UI_BOLD, fg=TEXT_PRIMARY, bg=BG_PANEL, width=12, anchor="w")
+        lbl_depth.pack(side="left")
+
+        default_depth = self.config.get("preferences", {}).get("mapper_max_depth", 3)
+        depth_str = f"{default_depth} Levels" if default_depth else "Full (Unlimited)"
+        self.mapper_depth_var = tk.StringVar(value=depth_str)
+        combo_depth = ttk.Combobox(
+            row1,
+            textvariable=self.mapper_depth_var,
+            values=["Full (Unlimited)", "1 Level", "2 Levels", "3 Levels", "4 Levels", "5 Levels", "6 Levels"],
+            width=16,
+            state="readonly",
+            font=FONT_UI
+        )
+        combo_depth.pack(side="left", padx=(0, 14))
+
+        self.mapper_ignore_hidden_var = tk.IntVar(value=1 if self.config.get("preferences", {}).get("mapper_ignore_hidden", True) else 0)
+        chk_hidden = tk.Checkbutton(
+            row1,
+            text="Exclude Hidden (.dotfiles)",
+            variable=self.mapper_ignore_hidden_var,
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_PANEL,
+            activebackground=BG_PANEL,
+            activeforeground=ACCENT_CYAN,
+            selectcolor=BG_SURFACE
+        )
+        chk_hidden.pack(side="left", padx=(0, 10))
+
+        self.mapper_folders_only_var = tk.IntVar(value=0)
+        chk_folders = tk.Checkbutton(
+            row1,
+            text="Directories Only",
+            variable=self.mapper_folders_only_var,
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_PANEL,
+            activebackground=BG_PANEL,
+            activeforeground=ACCENT_CYAN,
+            selectcolor=BG_SURFACE
+        )
+        chk_folders.pack(side="left", padx=(0, 14))
+
+        self.btn_map = tk.Button(
+            row1,
+            text="🗺️ Generate Tree Map",
+            font=FONT_UI_BOLD,
+            fg=BG_MAIN,
+            bg=ACCENT_CYAN,
+            activebackground="#79c0ff",
+            activeforeground=BG_MAIN,
+            relief="flat",
+            padx=14,
+            pady=3,
+            cursor="hand2",
+            command=self.toggle_map
+        )
+        self.btn_map.pack(side="left")
+
+        # 2. Status Strip
+        status_frame = tk.Frame(box, bg=BG_SURFACE, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        status_frame.pack(fill="x", pady=(0, 6), padx=2)
+
+        self.lbl_map_status = tk.Label(
+            status_frame,
+            text="Ready • Select a directory and click Generate Tree Map.",
+            font=FONT_UI,
+            fg=ACCENT_CYAN,
+            bg=BG_SURFACE,
+            padx=10,
+            pady=4
+        )
+        self.lbl_map_status.pack(side="left")
+
+        self.lbl_map_metrics = tk.Label(
+            status_frame,
+            text="Items Mapped: 0",
+            font=FONT_STATS,
+            fg=TEXT_MUTED,
+            bg=BG_SURFACE,
+            padx=10,
+            pady=4
+        )
+        self.lbl_map_metrics.pack(side="right")
+
+        # 3. Monospace ASCII Tree Text Display
+        text_box = tk.Frame(box, bg=BG_MAIN, highlightthickness=1, highlightbackground=BORDER_COLOR)
+        text_box.pack(fill="both", expand=True, padx=2, pady=(0, 6))
+
+        self.map_text = tk.Text(
+            text_box,
+            font=FONT_CODE,
+            bg=BG_MAIN,
+            fg=TEXT_PRIMARY,
+            relief="flat",
+            wrap="none",
+            padx=10,
+            pady=10
+        )
+        scroll_y = ttk.Scrollbar(text_box, orient="vertical", command=self.map_text.yview)
+        scroll_x = ttk.Scrollbar(text_box, orient="horizontal", command=self.map_text.xview)
+        self.map_text.configure(yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+
+        scroll_y.pack(side="right", fill="y")
+        scroll_x.pack(side="bottom", fill="x")
+        self.map_text.pack(side="left", fill="both", expand=True)
+
+        self.map_text.tag_config("HEADER", foreground=ACCENT_CYAN, font=("Consolas", 10, "bold"))
+        self.map_text.tag_config("FOLDER", foreground=ACCENT_GOLD, font=("Consolas", 10, "bold"))
+        self.map_text.tag_config("FILE", foreground=TEXT_PRIMARY)
+        self.map_text.tag_config("CONNECTOR", foreground=ACCENT_PURPLE)
+        self.map_text.tag_config("DENIED", foreground=ACCENT_CORAL)
+
+        # 4. Bottom Actions Bar
+        action_bar = tk.Frame(box, bg=BG_MAIN)
+        action_bar.pack(fill="x", padx=2, pady=2)
+
+        btn_copy = tk.Button(
+            action_bar,
+            text="📋  Copy Tree to Clipboard",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.copy_map_to_clipboard
+        )
+        btn_copy.pack(side="left", padx=(0, 6))
+
+        btn_export = tk.Button(
+            action_bar,
+            text="💾  Export Tree Map (.txt)...",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.on_export_map_tree
+        )
+        btn_export.pack(side="left", padx=2)
+
+        btn_clear = tk.Button(
+            action_bar,
+            text="🧹  Clear Map",
+            font=FONT_UI,
+            fg=TEXT_PRIMARY,
+            bg=BG_SURFACE,
+            activebackground=BG_ACTIVE,
+            activeforeground=TEXT_PRIMARY,
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self.clear_map_tree
+        )
+        btn_clear.pack(side="left", padx=2)
+
+        self.lbl_map_stats_summary = tk.Label(
+            action_bar,
+            text="Ready",
+            font=FONT_STATS,
+            fg=TEXT_MUTED,
+            bg=BG_MAIN
+        )
+        self.lbl_map_stats_summary.pack(side="right", padx=6)
+
     def build_log_tab(self, parent):
         box = tk.Frame(parent, bg=BG_MAIN, highlightthickness=1, highlightbackground=BORDER_COLOR)
         box.pack(fill="both", expand=True, padx=8, pady=8)
@@ -756,6 +1302,16 @@ class DriveAnalyzerApp:
         self.current_target = normalized
         self.lbl_active_target.config(text=f"Target: {normalized}")
         self.update_drive_gauge(normalized)
+
+        # Sync search and mapper paths if not manually set to another location
+        if hasattr(self, "search_path_var"):
+            curr_sp = self.search_path_var.get()
+            if not curr_sp or curr_sp == "None" or not os.path.exists(curr_sp):
+                self.search_path_var.set(normalized)
+        if hasattr(self, "mapper_path_var"):
+            curr_mp = self.mapper_path_var.get()
+            if not curr_mp or curr_mp == "None" or not os.path.exists(curr_mp):
+                self.mapper_path_var.set(normalized)
 
     def update_drive_gauge(self, path):
         try:
@@ -916,6 +1472,14 @@ class DriveAnalyzerApp:
                     self.lbl_current_folder.config(text=f"...{data['current_dir'][-45:]}" if len(data['current_dir']) > 45 else data['current_dir'])
                 elif msg_type == "COMPLETE":
                     self.on_scan_finished(data)
+                elif msg_type == "SEARCH_PROGRESS":
+                    self.on_search_progress(data)
+                elif msg_type == "SEARCH_COMPLETE":
+                    self.on_search_finished(data)
+                elif msg_type == "MAP_PROGRESS":
+                    self.on_map_progress(data)
+                elif msg_type == "MAP_COMPLETE":
+                    self.on_map_finished(data)
         except Exception:
             pass
         finally:
@@ -1158,10 +1722,380 @@ class DriveAnalyzerApp:
         self.status_lbl.config(text="Results cleared.")
         self.log_message("Cleared workspace results.", level="INFO")
 
+    # ==========================================================================
+    # ☆ FILE SEARCHER WORKER & ACTIONS
+    # ==========================================================================
+    def on_browse_search_path(self):
+        folder = filedialog.askdirectory(title="Select Folder to Search", initialdir=self.search_path_var.get() or self.current_target or "C:\\")
+        if folder:
+            self.search_path_var.set(os.path.normpath(folder) + os.sep)
+
+    def sync_search_with_active_target(self):
+        if self.current_target:
+            self.search_path_var.set(self.current_target)
+
+    def toggle_search(self):
+        if self.is_searching:
+            self.cancel_search()
+        else:
+            self.start_search()
+
+    def cancel_search(self):
+        if self.is_searching:
+            self.stop_search_requested = True
+            self.btn_search.config(text="Stopping...", state="disabled")
+            self.lbl_search_status.config(text="Aborting search...", fg=ACCENT_CORAL)
+
+    def start_search(self):
+        path = self.search_path_var.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Invalid Path", f"Search directory path does not exist:\n{path}")
+            return
+
+        query = self.search_query_var.get().strip()
+        ext = self.search_ext_var.get().strip()
+        limit_str = self.search_limit_var.get().strip()
+        limit = None if limit_str.upper() == "ALL" else int(limit_str)
+
+        self.is_searching = True
+        self.stop_search_requested = False
+        self.btn_search.config(text="⏹ Stop Search", bg=ACCENT_CORAL, activebackground="#ff7b72", state="normal")
+        self.lbl_search_status.config(text=f"Searching in {path}...", fg=ACCENT_CYAN)
+        self.lbl_search_metrics.config(text="Folders: 0 | Matches: 0 | Time: 00:00.0")
+
+        # Clear existing table
+        for row in self.tree_search.get_children():
+            self.tree_search.delete(row)
+
+        def worker():
+            res = search_files_engine(
+                search_path=path,
+                target_name=query,
+                ext_filter=ext,
+                limit=limit,
+                progress_callback=lambda p: self.background_queue.put(("SEARCH_PROGRESS", p)),
+                stop_check=lambda: self.stop_search_requested
+            )
+            res["aborted"] = self.stop_search_requested
+            self.background_queue.put(("SEARCH_COMPLETE", res))
+
+        self.search_thread = threading.Thread(target=worker, daemon=True)
+        self.search_thread.start()
+
+    def on_search_progress(self, data):
+        mins, secs = divmod(int(data["elapsed"]), 60)
+        frac = int((data["elapsed"] - int(data["elapsed"])) * 10)
+        time_str = f"{mins:02d}:{secs:02d}.{frac}"
+        self.lbl_search_metrics.config(
+            text=f"Folders: {data['folders_scanned']:,} | Matches: {data['matches_found']:,} | Time: {time_str}"
+        )
+
+    def on_search_finished(self, data):
+        self.is_searching = False
+        self.btn_search.config(text="🔍 Search Files", bg=ACCENT_CYAN, activebackground="#79c0ff", state="normal")
+        self.search_results = data["results"]
+        self.search_summary = data
+
+        duration = data["duration"]
+        total_m = data["total_matches"]
+        showing = len(data["results"])
+
+        if data.get("aborted"):
+            status_text = f"Search aborted. Found {total_m:,} matches ({showing} listed) in {duration:.2f}s."
+            self.lbl_search_status.config(text=status_text, fg=ACCENT_CORAL)
+            self.log_message(f"File search aborted: {showing} of {total_m:,} matches in {duration:.2f}s.", level="WARNING")
+        else:
+            status_text = f"Search complete! Found {total_m:,} matches ({showing} listed) in {duration:.2f}s."
+            self.lbl_search_status.config(text=status_text, fg=ACCENT_MINT)
+            self.log_message(f"File search completed: {total_m:,} matches found for '{data['target_name'] or '*'}' in {duration:.2f}s.", level="SUCCESS")
+
+        self.lbl_search_summary_count.config(text=f"{showing} of {total_m:,} matches listed")
+
+        for rank, r in enumerate(data["results"], start=1):
+            score_str = f"{r['relevance']:.1%}" if data["target_name"] else "N/A"
+            self.tree_search.insert("", "end", values=(
+                rank,
+                score_str,
+                r["name"],
+                r["ext"],
+                format_bytes(r["size"]),
+                r["dir"]
+            ))
+
+    def on_search_file_double_click(self, event):
+        self.reveal_selected_search_file()
+
+    def show_search_context_menu(self, event):
+        item = self.tree_search.identify_row(event.y)
+        if item:
+            self.tree_search.selection_set(item)
+            self.menu_search.post(event.x_root, event.y_root)
+
+    def reveal_selected_search_file(self):
+        sel = self.tree_search.selection()
+        if sel:
+            item = self.tree_search.item(sel[0])
+            name = item["values"][2]
+            folder = item["values"][5]
+            full_path = os.path.join(folder, name)
+            if os.path.exists(full_path):
+                subprocess.run(["explorer", f"/select,{full_path}"])
+            elif os.path.exists(folder):
+                subprocess.run(["explorer", folder])
+
+    def open_selected_search_file(self):
+        sel = self.tree_search.selection()
+        if sel:
+            item = self.tree_search.item(sel[0])
+            full_path = os.path.join(item["values"][5], item["values"][2])
+            if os.path.exists(full_path):
+                try:
+                    os.startfile(full_path)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not open file:\n{e}")
+
+    def copy_selected_search_file_path(self):
+        sel = self.tree_search.selection()
+        if sel:
+            item = self.tree_search.item(sel[0])
+            full_path = os.path.join(item["values"][5], item["values"][2])
+            self.root.clipboard_clear()
+            self.root.clipboard_append(full_path)
+            self.status_lbl.config(text=f"Copied: {full_path}")
+
+    def copy_selected_search_dir_path(self):
+        sel = self.tree_search.selection()
+        if sel:
+            item = self.tree_search.item(sel[0])
+            folder = item["values"][5]
+            self.root.clipboard_clear()
+            self.root.clipboard_append(folder)
+            self.status_lbl.config(text=f"Copied directory: {folder}")
+
+    def on_export_search_results(self):
+        if not self.search_results:
+            messagebox.showinfo("No Data", "No search results to export. Run a search first!")
+            return
+
+        date_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
+        query_slug = "".join(c for c in (self.search_query_var.get() or "search") if c.isalnum())
+        default_name = f"search_results_{query_slug}_{date_slug}.txt"
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Search Results",
+            initialfile=default_name,
+            defaultextension=".txt",
+            filetypes=[("Text File", "*.txt"), ("JSON File", "*.json"), ("CSV File", "*.csv")]
+        )
+        if not file_path:
+            return
+
+        fmt = "json" if file_path.endswith(".json") else ("csv" if file_path.endswith(".csv") else "txt")
+        saved = save_search_results(
+            results=self.search_results,
+            target_name=self.search_query_var.get(),
+            duration=self.search_summary.get("duration", 0),
+            filename=file_path,
+            export_format=fmt
+        )
+        if saved:
+            self.status_lbl.config(text=f"Exported: {os.path.basename(file_path)}")
+            self.log_message(f"Search results exported to: {file_path}", level="SUCCESS")
+            messagebox.showinfo("Export Successful", f"Search results saved to:\n{file_path}")
+
+    def clear_search_results(self):
+        for row in self.tree_search.get_children():
+            self.tree_search.delete(row)
+        self.search_results = []
+        self.lbl_search_status.config(text="Results cleared.", fg=TEXT_MUTED)
+        self.lbl_search_metrics.config(text="Folders: 0 | Matches: 0 | Time: 00:00.0")
+        self.lbl_search_summary_count.config(text="0 matches listed")
+
+    # ==========================================================================
+    # ☆ DIRECTORY MAPPER WORKER & ACTIONS
+    # ==========================================================================
+    def on_browse_mapper_path(self):
+        folder = filedialog.askdirectory(title="Select Folder to Map", initialdir=self.mapper_path_var.get() or self.current_target or "C:\\")
+        if folder:
+            self.mapper_path_var.set(os.path.normpath(folder) + os.sep)
+
+    def sync_mapper_with_active_target(self):
+        if self.current_target:
+            self.mapper_path_var.set(self.current_target)
+
+    def toggle_map(self):
+        if self.is_mapping:
+            self.cancel_map()
+        else:
+            self.start_map()
+
+    def cancel_map(self):
+        if self.is_mapping:
+            self.stop_map_requested = True
+            self.btn_map.config(text="Stopping...", state="disabled")
+            self.lbl_map_status.config(text="Aborting directory mapping...", fg=ACCENT_CORAL)
+
+    def start_map(self):
+        path = self.mapper_path_var.get().strip()
+        if not path or not os.path.exists(path):
+            messagebox.showerror("Invalid Path", f"Target directory path does not exist:\n{path}")
+            return
+
+        depth_val = self.mapper_depth_var.get().strip()
+        if "Full" in depth_val or "Unlimited" in depth_val:
+            max_depth = None
+        else:
+            try:
+                max_depth = int(depth_val.split()[0])
+            except Exception:
+                max_depth = 3
+
+        ignore_hidden = bool(self.mapper_ignore_hidden_var.get())
+        folders_only = bool(self.mapper_folders_only_var.get())
+
+        self.is_mapping = True
+        self.stop_map_requested = False
+        self.btn_map.config(text="⏹ Stop Mapping", bg=ACCENT_CORAL, activebackground="#ff7b72", state="normal")
+        self.lbl_map_status.config(text=f"Mapping directory tree for {path}...", fg=ACCENT_CYAN)
+        self.lbl_map_metrics.config(text="Items Mapped: 0")
+
+        self.map_text.delete("1.0", "end")
+        self.map_text.insert("end", f"Scanning directory structure for: {path}...\n", "HEADER")
+
+        def worker():
+            res = generate_directory_tree(
+                start_path=path,
+                max_depth=max_depth,
+                ignore_hidden=ignore_hidden,
+                folders_only=folders_only,
+                stop_check=lambda: self.stop_map_requested,
+                progress_callback=lambda d, f: self.background_queue.put(("MAP_PROGRESS", {"dirs": d, "files": f}))
+            )
+            res["aborted"] = self.stop_map_requested
+            self.background_queue.put(("MAP_COMPLETE", res))
+
+        self.map_thread = threading.Thread(target=worker, daemon=True)
+        self.map_thread.start()
+
+    def on_map_progress(self, data):
+        total = data["dirs"] + data["files"]
+        self.lbl_map_metrics.config(text=f"Dirs: {data['dirs']:,} | Files: {data['files']:,} (Total: {total:,})")
+
+    def on_map_finished(self, data):
+        self.is_mapping = False
+        self.btn_map.config(text="🗺️ Generate Tree Map", bg=ACCENT_CYAN, activebackground="#79c0ff", state="normal")
+        self.map_result_text = data["text"]
+        self.map_stats = data["stats"]
+
+        stats = data["stats"]
+        self.map_text.delete("1.0", "end")
+
+        for line in data["lines"]:
+            if line.startswith("☆ Directory Map for:"):
+                self.map_text.insert("end", line + "\n", "HEADER")
+            elif "[Permission Denied]" in line or "[Error:" in line:
+                self.map_text.insert("end", line + "\n", "DENIED")
+            elif line.endswith("/"):
+                self.map_text.insert("end", line + "\n", "FOLDER")
+            else:
+                self.map_text.insert("end", line + "\n", "FILE")
+
+        if data.get("aborted"):
+            status_str = f"Mapping aborted. Mapped {stats['dir_count']:,} dirs, {stats['file_count']:,} files in {stats['duration']:.2f}s."
+            self.lbl_map_status.config(text=status_str, fg=ACCENT_CORAL)
+            self.log_message(f"Directory tree mapping aborted for {data['start_path']}.", level="WARNING")
+        else:
+            status_str = f"Mapping complete! Mapped {stats['dir_count']:,} dirs and {stats['file_count']:,} files in {stats['duration']:.2f}s."
+            self.lbl_map_status.config(text=status_str, fg=ACCENT_MINT)
+            self.log_message(f"Directory tree mapped for {data['start_path']}: {stats['dir_count']:,} dirs, {stats['file_count']:,} files in {stats['duration']:.2f}s.", level="SUCCESS")
+
+        self.lbl_map_metrics.config(text=f"Dirs: {stats['dir_count']:,} | Files: {stats['file_count']:,}")
+        self.lbl_map_stats_summary.config(text=f"{stats['dir_count']:,} dirs, {stats['file_count']:,} files ({stats['duration']:.2f}s)")
+
+    def copy_map_to_clipboard(self):
+        if not self.map_result_text:
+            messagebox.showinfo("No Data", "No directory tree to copy. Generate a map first!")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.map_result_text)
+        self.status_lbl.config(text="Directory tree copied to clipboard.")
+        messagebox.showinfo("Copied", "Directory tree map copied to clipboard!")
+
+    def on_export_map_tree(self):
+        if not self.map_result_text:
+            messagebox.showinfo("No Data", "No directory tree to export. Generate a map first!")
+            return
+
+        date_slug = datetime.now().strftime("%Y%m%d_%H%M%S")
+        target_path = self.mapper_path_var.get().strip()
+        safe_name = "".join(c for c in os.path.basename(target_path.rstrip("\\/")) if c.isalnum()) or "dir"
+        default_file = f"directory_map_{safe_name}_{date_slug}.txt"
+
+        file_path = filedialog.asksaveasfilename(
+            title="Export Directory Tree Map",
+            initialfile=default_file,
+            defaultextension=".txt",
+            filetypes=[("Text File", "*.txt")]
+        )
+        if not file_path:
+            return
+
+        saved = save_map_tree(self.map_result_text, target_path, filename=file_path)
+        if saved:
+            self.status_lbl.config(text=f"Exported: {os.path.basename(file_path)}")
+            self.log_message(f"Directory tree map saved to: {file_path}", level="SUCCESS")
+            messagebox.showinfo("Export Successful", f"Directory map saved to:\n{file_path}")
+
+    def clear_map_tree(self):
+        self.map_text.delete("1.0", "end")
+        self.map_result_text = ""
+        self.map_stats = {}
+        self.lbl_map_status.config(text="Tree map cleared.", fg=TEXT_MUTED)
+        self.lbl_map_metrics.config(text="Items Mapped: 0")
+        self.lbl_map_stats_summary.config(text="Ready")
+
+    def sort_tree(self, tree, col, reverse, is_num=False, is_pct=False, is_size=False):
+        """Sorts ttk.Treeview content when clicking column headers."""
+        items = [(tree.set(k, col), k) for k in tree.get_children("")]
+
+        def sort_key(item):
+            val = item[0]
+            if is_pct:
+                try:
+                    return float(val.replace("%", "").strip())
+                except ValueError:
+                    return -1.0
+            elif is_num:
+                try:
+                    return int(val)
+                except ValueError:
+                    return -1
+            elif is_size:
+                try:
+                    parts = val.strip().split()
+                    if len(parts) == 2:
+                        num = float(parts[0])
+                        unit = parts[1].upper()
+                        mult = {"B": 1, "KB": 1024, "MB": 1024**2, "GB": 1024**3, "TB": 1024**4}.get(unit, 1)
+                        return num * mult
+                except Exception:
+                    pass
+                return 0
+            return val.lower()
+
+        items.sort(key=sort_key, reverse=reverse)
+
+        for index, (val, k) in enumerate(items):
+            tree.move(k, "", index)
+
+        tree.heading(col, command=lambda: self.sort_tree(tree, col, not reverse, is_num, is_pct, is_size))
+
     def on_window_close(self):
-        if self.is_scanning:
-            if messagebox.askyesno("Scan in Progress", "A storage scan is currently running. Do you want to cancel and exit?"):
+        if self.is_scanning or self.is_searching or self.is_mapping:
+            if messagebox.askyesno("Operation in Progress", "A background task is currently running. Do you want to cancel and exit?"):
                 self.stop_requested = True
+                self.stop_search_requested = True
+                self.stop_map_requested = True
                 self.root.destroy()
         else:
             self.root.destroy()
@@ -1175,13 +2109,22 @@ def main():
 
     # Check CLI flags
     if len(sys.argv) > 1:
-        if sys.argv[1] == "--cli":
+        flag = sys.argv[1]
+        if flag == "--cli":
             target = sys.argv[2] if len(sys.argv) > 2 else None
             from custom_drive_analyzer import get_largest_items
             get_largest_items(target=target)
             return
-        elif not sys.argv[1].startswith("-"):
-            target_arg = sys.argv[1]
+        elif flag in ("--search", "-s"):
+            target = sys.argv[2] if len(sys.argv) > 2 else None
+            cli_search_files(target_dir=target)
+            return
+        elif flag in ("--map", "-m"):
+            target = sys.argv[2] if len(sys.argv) > 2 else None
+            cli_map_directory(start_path=target)
+            return
+        elif not flag.startswith("-"):
+            target_arg = flag
 
     root = tk.Tk()
     app = DriveAnalyzerApp(root, initial_target=target_arg)

@@ -1,6 +1,6 @@
 {
   "app_name": "Stellar Snooper",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "theme": {
     "palette": "dark_cosmic",
     "high_dpi": true
@@ -15,6 +15,10 @@
     "default_drive": "C:",
     "top_files_limit": 20,
     "top_folders_limit": 10,
+    "search_limit": 50,
+    "search_default_extension": "ANY",
+    "mapper_max_depth": 3,
+    "mapper_ignore_hidden": true,
     "export_format": "json",
     "scan_hidden_files": true,
     "confirm_exit_on_scan": true
