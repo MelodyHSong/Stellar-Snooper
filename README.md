@@ -4,6 +4,9 @@
 
 Welcome to **Stellar Snooper**! ⭐🛸🔍 This project is a modern Windows desktop workstation utility built with Python and Tkinter—converted from a command-line script into the full **Desktop Tool Template** architecture with cosmic dark aesthetics, non-blocking asynchronous scanning, interactive tables, and Windows Explorer right-click integration.
 
+<img width="1268" height="808" alt="image" src="https://github.com/user-attachments/assets/006550b4-2ed5-4130-acd9-92966f017a65" />
+
+
 ---
 
 ## ✨ Architecture & Key Features
