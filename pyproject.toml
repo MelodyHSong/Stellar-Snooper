@@ -1,0 +1,28 @@
+﻿[build-system]
+requires = [setuptools>=61.0]
+build-backend = setuptools.build_meta
+
+[project]
+name = stellar-snooper
+version = 1.0.0
+authors = [
+  { name=Melody H. Song },
+]
+description = Stellar Snooper - Cosmic Storage Telemetry and Disk Space Workstation
+readme = README.md
+requires-python = >=3.8
+classifiers = [
+    Programming Language :: Python :: 3,
+    License :: OSI Approved :: MIT License,
+    Operating System :: Microsoft :: Windows,
+    Environment :: Win32 (MS Windows),
+    Topic :: System :: Systems Administration,
+    Topic :: Utilities,
+]
+dependencies = [
+    pillow>=10.0.0,
+]
+
+[project.optional-dependencies]
+build = [pyinstaller>=6.0.0]
+cli = [tqdm>=4.66.0]
