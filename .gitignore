@@ -34,3 +34,6 @@ ehthumbs.db
 *.tmp
 user_data/
 reports/
+
+# Private Notes & Drafts
+misc/
